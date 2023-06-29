@@ -1,0 +1,2 @@
+"PointID" "long" "lat" "elev" "mat" "map" "gsp" "mtcm" "mmin" "mtwm" "mmax" "sday" "fday" "ffp" "dd5" "gsdd5" "d100" "dd0" "mmindd0" "smrpb" "smrsprpb" "sprp" "smrp" "winp"
+"TigerMtn" -122.0345 47.5297 200 12.6 1471 400 6.1 3 20.5 25.9 53 331 273 2879 2654 40 7 79 0.59 0.36 196 71 774

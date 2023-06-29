@@ -1,0 +1,4 @@
+line 1 num tokens= 4 
+head= TRUE 
+colnames assigned= pointid lon lat elev 
+withelev= TRUE 

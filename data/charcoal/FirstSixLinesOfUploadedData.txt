@@ -1,0 +1,2 @@
+Site_name	long	lat	elev
+TigerMtn	-122.0345	47.5297	200

@@ -1,0 +1,6 @@
+"species_code","current","future","Common_Name","latin","Genus","Species","Variety","Subspecies"
+"PSME",0.546099290780142,0.416666666666667,"Douglas-fir","Pseudotsuga_menziesii","Pseudotsuga","menziesii",NA,NA
+"THPL",0.315602836879433,0.25,"western redcedar","Thuja_plicata","Thuja","plicata",NA,NA
+"TSHE",0.294326241134752,0.0833333333333333,"western hemlock","Tsuga_heterophylla","Tsuga","heterophylla",NA,NA
+"POBAT",0.109929078014184,0.0833333333333333,"black cottonwood","Populus_balsamifera_trichocarpa","Populus","balsamifera",NA,"trichocarpa"
+"QUGA4",0.00354609929078014,0.0833333333333333,"Oregon white oak","Quercus_garryana","Quercus","garryana",NA,NA

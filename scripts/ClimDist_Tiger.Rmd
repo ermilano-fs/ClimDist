@@ -1,0 +1,742 @@
+---
+title: "ClimDist_TigerMtn"
+author: "Elizabeth R. Milano"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Climate Distance mapper - Tiger Mountain example
+
+**Purpose:** Climate Distance algorithm for current and future analogs.
+**Background:** Climate Distance project aims to identify contemporary
+climate analog locations for future climate scenarios at focal points of
+interest based on derived climate variables, plant survey data, and biotic community classifications (hereafter biomes). This
+document identifies analogs for the Tiger Mountain target location using the Forest Inventory and Analysis dataset, and Brown's biomes.  
+
+**Data:**   
+
+* Background point dataset: This is used to define analog thresholds and
+determine `mean` and `sd` of derived climate variables for standardization
+purposes. The dataset is comprised of 988 lat/long locations, each point
+was then sampled along an artificial elevation cline to create a set of
+50,388 observations. This analysis was done in a previous script and
+does not change across reference databases.   
+* Reference point dataset: For each inventory database (FIA, biome,
+ect.), contemporary climate data was pulled from
+`https://charcoal2.cnre.vt.edu//climate/customData/` for all lat/long
+occurrences. 
+Biome classification can be found at
+`http://www.peter.unmack.net/biotic/`.
+FIA data https://apps.fs.usda.gov/fia/datamart/datamart.html.
+Data accessed Nov. 2022.   
+* Target dataset: Contains 13 future climate projections and contemporary data from source
+above for Tiger Mountain. *Note: This script is set up to loop through a list of target locations and create separate output files for each, however we will only focus on a single location for sake of example*   
+
+**Analysis:** We are interested in comparing plant species abundance and
+composition between contemporary climate analogs and future climate
+analogs. For both contemporary and future scenarios the nearest neighbor
+imputation with `yaimpute` function is run twice. First on the set of
+reference points to identify top 10,000 nearest neighbor distances which
+are carried forward to a second imputation with the added target
+contemporary or future occurrences. Analogs are identified under `Edist <0.84` threshold.
+
+**Results files:** Text files contain list of analogs for each location and
+climate scenario, data for each analog includes lat/long, Edist (climate
+distance), km (geographic distance from focal location), and either
+species occurrence information or biome classification. Summary tables follow results output. 
+Species comparisons and maps are generated in separate script.
+
+```{r env}
+setwd("/Users/elizabethmilano/Library/CloudStorage/Box-Box/01. elizabeth.milano Workspace/ClimDist/github/scripts")
+rm(list=ls())
+
+library(yaImpute) # nearest neighbor
+library(gower)
+library(geosphere) # calculate km distance between geo points
+library(tidyverse) # tidy data
+```
+
+## Load data
+
+### Background data stats
+
+Used for standardization and thresholds.\
+
+```{r stats_data}
+stats <- read.csv("../data/ClimDist_stats.csv")
+```
+
+### Reference data
+
+#### Current climate
+
+Reference dataset is a combined set of points from FIA and biome data. A
+new PointID index was generated for the biome and FIA points by starting the count at
+30,000 and 500,000 to avoid duplication with the AIM dataset (not used for Tiger Mountain).
+
+```{r ref_data}
+# Current climate for reference points
+#aim.data <- read.table("../data/AIM_currentClim_derived.txt",header=T,sep="",na.strings=".") %>%
+#  rename(mindd0 = mmindd0) %>%
+#  select(-smrsprpb, -smrpb) %>%
+#  mutate(zone = NA,
+#         PointID_biome = NA,
+#         PointID_fia = NA)
+
+biome.tmp <- read.table("../data/BRupdate.txt",header=T,sep="",na.strings=".") %>%
+  rename(PointID_biome = PointID,
+         smrp = sump) 
+n_row.b <- nrow(biome.tmp)
+biome.data <- biome.tmp %>%
+  mutate(PointID = seq(30001,(30000+n_row.b)), #index accounts for AIM dataset, if using.
+         PointID_fia = NA)
+
+
+fia.tmp1 <- read.table("../data/FIA_08.24.15.txt",header=T,sep="",na.strings=".") %>%
+  rename(PointID_fia = newid,
+         smrp = sump)
+n_row.f <- nrow(fia.tmp1)
+fia.tmp2 <- fia.tmp1 %>%
+  mutate(PointID = seq(500001,(500000+n_row.f)), #index accounts for AIM and biome datasets, if using.
+         PointID_biome = NA,
+         zone = NA)
+fia.data <- fia.tmp2 %>%
+  select(PointID, long, lat, elev, mat, map, gsp, dd5, dd0, gsdd5, mtcm, mmin, mtwm, mmax, sday, fday, ffp, d100, mindd0, winp, smrp, sprp,
+         PointID_biome, zone, PointID_fia)
+
+ref.data <- rbind(#aim.data, 
+                  biome.data, 
+                  fia.data) %>%
+  select(-PointID_biome, -PointID_fia)
+
+```
+
+#### Vegetation and biomes
+
+```{r veg_data}
+# Vegetation
+#aim.species <- read.table("../data/BLMfull_withnox.csv",header=T,sep=",",na.strings="NA") 
+
+#biome
+biome <- biome.data %>%
+  select(PointID, PointID_biome, zone)
+biome.code <- read.delim("../data/Brown_biome_code.txt")
+
+#FIA
+fia.species <- fia.tmp2 %>%
+  select(-mat, -map, -gsp, -dd5, -dd0, -gsdd5, -mtcm, -mmin, -mtwm, -mmax, -sday, -fday, -ffp, -d100, -mindd0, -winp, -smrp, -sprp,
+         -PointID_biome, -zone, -long, -lat, -elev, -PIGL.1)
+# FIA species
+fia.species.lookup <- read.csv("../data/FIA_master_list.csv", na.strings = "NA") %>%
+  unite("latin", Genus, Species, Subspecies, Variety, na.rm = TRUE, remove = FALSE) %>%
+  rename(species_code = PLANTS_Code)
+```
+
+### Target data
+
+#### Future climate
+
+Pull `*_y2060_derived.txt` files from
+`https://charcoal2.cnre.vt.edu//climate/customData/`.
+
+```{r future_data}
+
+# Target points
+target.future.files <- list.files(path="../data/charcoal",full.names=TRUE, pattern = "y2060_derived.txt$")
+
+# list futures
+future.table <- data.frame(Filepath = target.future.files) %>%
+  separate(col = Filepath, sep = "/", into = c(NA, NA, NA, "File")) %>%
+  separate(col = File, sep = "_", into = c("Model", "Scenario", "Year"), remove = FALSE)
+
+target.future.data <- read_delim(target.future.files, col_names = TRUE, delim=" ", na=".", show_col_types = FALSE) %>% 
+  bind_rows() %>%
+  group_by(PointID) %>%
+  summarise_all(mean)%>%
+  rename(mindd0 = mmindd0)
+write.csv(target.future.data, "../output/future/future_climate_target.csv", row.names = FALSE)
+
+
+# list focal points
+fp.table <- target.future.data %>%
+  select(PointID, long, lat, elev) %>%
+  rename("Longitude W" = "long",
+         "Latitude N" = "lat",
+         "Elevation m" = "elev")
+
+```
+
+#### Contemporary climate
+
+```{r current_data}
+
+target.current.data <- read.table("../data/charcoal/currentClim_derived.txt",header=T,sep="",na.strings=".") %>%
+
+  rename(mindd0 = mmindd0)
+write.csv(target.current.data, "../output/current/current_climate_target.csv", row.names = FALSE)
+
+
+```
+
+#### Target data summary
+
+```{r table1, echo=FALSE}
+knitr::kable(future.table, format = "simple", caption = "Table 1. Future climate scenarios.")
+```
+
+```{r table2, echo=FALSE}
+knitr::kable(fp.table, format = "simple", caption = "Table 2. Target point location(s).")
+```
+
+## Functions
+
+1.  Create derived climate variables
+
+Climate variable definitions:   
+All temperature is in degrees C and precipitation in mm.    
+
+Raw variables:   
+**dd5** = Degree-days \>5 (based on mean monthly temperature).  
+**mat** = Mean annual temperature.   
+**d100** = Julian date the sum of degree-days >5 reaches 100.  
+**map** = Mean annual precipitation.  
+**gsp** = Growing season precipitation, April to September.  
+**smrp** = Summer precipitation: jul+aug.
+**sprp** = Spring precipitation: 
+**winp** = Winter precipitation: nov+dec+jan+feb.   
+**mmax** = Mean maximum temperature in the warmest month.   
+**mtcm** = Mean temperature in the coldest month.   
+The following are not included directly in climate distance, but used to calculate
+derived variables:   
+*mmindd0* = Degree-days \<0 (based on mean minimum monthly temperature); a.k.a. *mindd0*.   
+*gsdd5* = Degree-days \>5 accumulating within the frost-free period.   
+*mtwm* = Mean temperature in the warmest month.    
+
+Derived variables:  
+**tdiff** = Mean temp warmest month minus coldest month, `mtwm - mtcm`.   
+**pratio** = Ratio of summer precipitation to total precipitation, `gsp / map`.   
+**adi** = Annual dryness index, `sqrt(dd5)/map`.   
+**sdi** = Summer dryness index, `sqrt(gsdd5)/gsp`.  
+**adimindd0** = `adi * (mindd0 + 1)`   
+**sdimindd0** = `(sqrt(gsdd5) / gsp) * (mindd0 + 1))`   
+**mapdd5** = `(map * dd5) / 1000`  
+**gspdd5** = `(gsp * dd5) / 1000`  
+**smratio** = `smrp/gsp` 
+```{r functions1}
+der.vars <- function(df) {
+  output <- df %>%
+    mutate(tdiff = mtwm - mtcm,
+           pratio = gsp / map,
+           adi = (dd5 ** 0.5) / map,
+           sdi = (gsdd5 ** 0.5) / gsp,
+           mapdd5 = (map * dd5) / 1000,
+           gspdd5 = (gsp * dd5) / 1000,
+           adimindd0 = adi * (mindd0 + 1),
+           sdimindd0 = ((gsdd5 ** 0.5) / gsp) * (mindd0 + 1),
+           smratio = smrp/gsp) 
+  return(output)
+}
+```
+
+
+
+2.  Standardize new variables with `stats` dataset
+
+
+
+
+```{r functions2}
+# Standardize vars with "stats"
+std.stats <- function(df){
+  output <- df %>%
+    dplyr::mutate(dd5 = (dd5 - stats$Xdd5) / stats$Sdd5,
+           mat = (mat - stats$Xmat) / stats$Smat,
+           d100 = (d100 - stats$Xd100) / stats$Sd100,
+           map = (map - stats$Xmap) / stats$Smap,
+           gsp = (gsp - stats$Xgsp) / stats$Sgsp,
+           winp = (winp - stats$Xwinp) / stats$Swinp,
+           mmax = (mmax - stats$Xmmax) / stats$Smmax,
+           tdiff = (tdiff - stats$Xtdiff) / stats$Stdiff,
+           pratio = (pratio - stats$Xpratio) / stats$Spratio,
+           adi = (adi - stats$Xadi) / stats$Sadi,
+           sdi = (sdi - stats$Xsdi) / stats$Ssdi,
+           adimindd0 = (adimindd0 - stats$Xadimindd0) / stats$Sadimindd0,
+           sdimindd0 = (sdimindd0 - stats$Xsdimindd0) / stats$Ssdimindd0,
+           mtcm = (mtcm - stats$Xmtcm) / stats$Smtcm,
+           mapdd5 = (mapdd5 - stats$Xmapdd5) / stats$Smapdd5,
+           gspdd5 = (gspdd5 - stats$Xgspdd5) / stats$Sgspdd5,
+           smrp = (smrp - stats$Xsmrp)/stats$Ssmrp, 
+           sprp = (sprp -stats$Xsprp)/stats$Ssprp, 
+           smratio = (smratio - stats$Xsmratio)/stats$Ssmratio 
+          ) %>%
+    select(PointID, long, lat, elev, dd5, mat, d100, map, gsp, winp, mmax, tdiff, pratio, adi, sdi, adimindd0, sdimindd0, mtcm, mapdd5, gspdd5, smrp, sprp, smratio)
+  return(output)
+}
+```
+
+## Data Transformation
+
+Apply functions above to prepare files.
+
+```{r transform}
+# reference data
+ref.vars <- der.vars(ref.data)
+ref <- std.stats(ref.vars)
+
+# target future data
+target.future.vars <- der.vars(target.future.data)
+target.future <- std.stats(target.future.vars)
+
+# target current data
+target.current.vars <- der.vars(target.current.data)
+target.current <- std.stats(target.current.vars)
+```
+
+## Find future climate analogs
+
+-   Use `yaImpute` to calculate nearest neighbors for current climate
+    reference points.\
+-   Then apply to future climate of focal points.\
+-   Select analog points with `Edist < 0.9` (from threshold
+    calculation).\
+-   Calculate distance in km from focal point to analog point and
+    classify as strong, moderate, or weak.\
+-   Output `.txt` files for each focal location with analog points and
+    current species occurrences or biome classifications.\
+      (+ AIM `/output/future/future_analog_[location]_AIM.txt`) *not used for Tiger Mtn*\
+       + Biome `/output/future/future_analog_[location]_biome.txt`\
+       + FIA `/output/future/future_analog_[location]_FIA.txt`\
+
+```{r yaimpute_f}
+#aim.future <- list()
+biome.future <- list()
+fia.future <- list()
+#clim.future <- list()
+
+ for (irow in 1:nrow(target.future))
+ {
+
+ trg <- target.future[irow,]
+ 
+ # set focal point lat/long
+ trg.long <- trg$long
+ trg.lat <- trg$lat
+ trg.elev <- trg$elev
+ 
+ # yai format needs rownames
+ rownames(ref) = paste("R",sprintf(fmt="%4.4d",1:nrow(ref)),sep="")
+ rownames(trg) = paste("",sprintf(fmt="%4.4d",1:nrow(trg)),sep="")
+ 
+ # yaImpute
+ yai = yai (x=ref[,5:ncol(ref)],method="raw",noRefs=TRUE,k=2500)
+ yai2 = newtargets(yai,newdata=trg)
+ 
+ # pull results
+ ids = yai2$neiIdsTrg[,1:2500] # identifies R_number from ref
+ dsts = round(yai2$neiDstTrg[,1:2500],2)
+
+  # format output
+#	aim.future[[trg$PointID]] <- data.frame(Edist=dsts, id=ids) %>%
+#	  filter(Edist <= 1.75) %>%
+#	  left_join(ref %>% rownames_to_column("rowname"), by=c("id"="rowname")) %>% # join by 'R' rowname of ref
+#	  select(PointID, long, lat, elev, Edist) %>%
+#	  mutate(Edist_thresh = case_when(
+#      Edist <= 0.6 ~ "strong",
+#      Edist > 0.6 & Edist <= 0.72 ~ "moderate",
+#      Edist > 0.72 & Edist <= 0.84 ~ "weak",
+#      Edist > 0.84 ~ "under_thresh",
+#      TRUE ~ "NA")) %>%
+#	  rowwise() %>% # needed for km calculation
+#	  mutate(elev_diff = trg.elev - elev,
+#	         km = (distm(c(trg.long, trg.lat), c(long,lat), fun = distGeo)/1000)[1]) %>% # km distance between focal and analog lat/long
+#	  left_join(aim.species) %>%
+#	  drop_na() %>% 
+#	  select_if(~ !is.numeric(.) || sum(.) != 0) # remove species columns without info
+#
+#    write.table (aim.future[[trg$PointID]], paste0("../output/future/","future_analog_", trg$PointID, "_AIM.txt"),row.names=FALSE)
+
+    biome.future[[trg$PointID]] <- data.frame(Edist=dsts, id=ids) %>%
+	  filter(Edist <= 1.75) %>%
+	  left_join(ref %>% rownames_to_column("rowname"), by=c("id"="rowname")) %>% # join by 'R' rowname of ref
+	  select(PointID, long, lat, elev, Edist) %>%
+	  mutate(Edist_thresh = case_when(
+      Edist <= 0.6 ~ "strong",
+      Edist > 0.6 & Edist <= 0.72 ~ "moderate",
+      Edist > 0.72 & Edist <= 0.84 ~ "weak",
+      Edist > 0.84 ~ "under_thresh",
+	    TRUE ~ "NA")) %>%
+	  rowwise() %>% # needed for km calculation
+	  mutate(elev_diff = trg.elev - elev,
+	         km = (distm(c(trg.long, trg.lat), c(long,lat), fun = distGeo)/1000)[1]) %>% # km distance between focal and analog lat/long
+	  left_join(biome) %>%
+    left_join(biome.code) %>%
+    drop_na()
+
+    write.table (biome.future[[trg$PointID]], paste0("../output/future/","future_analog_", trg$PointID, "_biome.txt"),row.names=FALSE)
+    
+    fia.future[[trg$PointID]] <- data.frame(Edist=dsts, id=ids) %>%
+	  filter(Edist <= 1.75) %>%
+	  left_join(ref %>% rownames_to_column("rowname"), by=c("id"="rowname")) %>% # join by 'R' rowname of ref
+	  select(PointID, long, lat, elev, Edist) %>%
+	  mutate(Edist_thresh = case_when(
+      Edist <= 0.6 ~ "strong",
+      Edist > 0.6 & Edist <= 0.72 ~ "moderate",
+      Edist > 0.72 & Edist <= 0.84 ~ "weak",
+      Edist > 0.84 ~ "under_thresh",
+      TRUE ~ "NA")) %>%
+	  rowwise() %>% # needed for km calculation
+	  mutate(elev_diff = trg.elev - elev,
+	         km = (distm(c(trg.long, trg.lat), c(long,lat), fun = distGeo)/1000)[1]) %>% # km distance between focal and analog lat/long
+	  left_join(fia.species) %>%
+	  drop_na() %>% 
+	  select_if(~ !is.numeric(.) || sum(.) != 0) # remove species columns without info
+
+    write.table (fia.future[[trg$PointID]], paste0("../output/future/","future_analog_", trg$PointID, "_FIA.txt"),row.names=FALSE)
+    
+#    ## output climate vars for all analogs
+#    clim.future[[trg$PointID]] <- data.frame(Edist=dsts, id=ids) %>%
+#	  filter(Edist <= 1.75) %>%
+#	  left_join(ref %>% rownames_to_column("rowname"), by=c("id"="rowname")) %>% # join by 'R' rowname of ref
+##	  select(PointID, long, lat, elev, Edist) %>%
+#	  mutate(Edist_thresh = case_when(
+#      Edist <= 0.6 ~ "strong",
+#      Edist > 0.6 & Edist <= 0.72 ~ "moderate",
+#      Edist > 0.72 & Edist <= 0.84 ~ "weak",
+#      Edist > 0.84 ~ "under_thresh",
+#	           TRUE ~ "NA"),
+#	   analog_dataset = case_when(
+#	    PointID <= 30000 ~ "AIM",
+#	    PointID > 30000 & PointID <= 500000 ~ "Biome",
+#	    PointID > 500000 ~ "FIA",
+#	    TRUE ~ "NA")) %>%
+#	  rowwise() %>% # needed for km calculation
+#	  mutate(elev_diff = trg.elev - elev,
+#	         km = (distm(c(trg.long, trg.lat), c(long,lat), fun = distGeo)/1000)[1]) %>% # km distance between focal and analog lat/long
+#	  drop_na()
+#
+#    write.table (clim.future[[trg$PointID]], paste0("../output/future/","future_analog_", trg$PointID, "_climate.txt"),row.names=FALSE)
+}
+
+#clim.future.df <-  bind_rows(clim.future, .id = "PlotID") %>%
+#  filter(Edist < 0.9)
+#write.csv(clim.future.df, "../output/future/future_GB_trans_climate.csv", row.names = FALSE)
+```
+
+```{r table3, echo=FALSE}
+#knitr::kable(aim.future[[8]][1:5,1:15], format = "simple", caption = "Table 3. Example format for output file for future climate analogs with AIM species composition.")
+```
+
+
+```{r table4, echo=FALSE}
+knitr::kable(biome.future[[1]][1:6,], format = "simple", caption = "Table 4. Example format for output file for future climate analogs with biome classification.")
+```
+
+
+```{r table5, echo=FALSE}
+knitr::kable(fia.future[[1]][1:6,], format = "simple", caption = "Table 5. Example format for output file for future climate analogs with FIA species composition.")
+```
+
+## Find current climate analogs
+
+-   Same process as future climate analogs except using the contemporary
+    climate data as target dataset.\
+-   Output files:\
+      (+ AIM `/output/current/current_analog_[location]_AIM.txt`) *not used for Tiger Mtn*\
+       + Biome `/output/current/current_analog_[location]_biome.txt`\
+       + FIA `/output/current/current_analog_[location]_FIA.txt`\
+
+```{r yaimpute_c}
+#aim.current <- list()
+biome.current <- list()
+fia.current <- list()
+
+ for (irow in 1:nrow(target.current))
+ {
+
+ trg <- target.current[irow,]
+
+ # set focal point lat/long
+ trg.long <- trg$long
+ trg.lat <- trg$lat
+ trg.elev <- trg$elev
+
+ # yai format needs rownames
+ rownames(ref) = paste("R",sprintf(fmt="%4.4d",1:nrow(ref)),sep="")
+ rownames(trg) = paste("",sprintf(fmt="%4.4d",1:nrow(trg)),sep="")
+ 
+ # yaImpute
+ yai = yai (x=ref[,5:ncol(ref)],method="raw",noRefs=TRUE,k=2500)
+ yai2 = newtargets(yai,newdata=trg)
+ 
+ # pull results
+ ids = yai2$neiIdsTrg[,1:2500] # identifies R_number from ref
+ dsts = round(yai2$neiDstTrg[,1:2500],2)
+
+  # format output
+#	aim.current[[trg$PointID]] <- data.frame(Edist=dsts, id=ids) %>%
+#	  filter(Edist <= 1.75) %>%
+#	  left_join(ref %>% rownames_to_column("rowname"), by=c("id"="rowname")) %>% # join by 'R' rowname of ref
+#	  select(PointID, long, lat, elev, Edist) %>%
+#	  mutate(Edist_thresh = case_when(
+#      Edist <= 0.6 ~ "strong",
+#      Edist > 0.6 & Edist <= 0.72 ~ "moderate",
+#      Edist > 0.72 & Edist <= 0.84 ~ "weak",
+#      Edist > 0.84 ~ "under_thresh",
+#	    TRUE ~ "NA")) %>%
+#	  rowwise() %>% # needed for km calculation
+#	  mutate(elev_diff = trg.elev - elev,
+#	         km = (distm(c(trg.long, trg.lat), c(long,lat), fun = distGeo)/1000)[1]) %>% # km distance between focal and analog lat/long
+#	  left_join(aim.species) %>%
+#	  drop_na() %>% 
+#	  select_if(~ !is.numeric(.) || sum(.) != 0) # remove species columns without info
+# 
+#    write.table (aim.current[[trg$PointID]], paste0("../output/current/","current_analog_", trg$PointID, "_AIM.txt"),row.names=FALSE)
+
+    
+    biome.current[[trg$PointID]] <- data.frame(Edist=dsts, id=ids) %>%
+	  filter(Edist <= 1.75) %>%
+	  left_join(ref %>% rownames_to_column("rowname"), by=c("id"="rowname")) %>% # join by 'R' rowname of ref
+	  select(PointID, long, lat, elev, Edist) %>%
+	  mutate(Edist_thresh = case_when(
+      Edist <= 0.6 ~ "strong",
+      Edist > 0.6 & Edist <= 0.72 ~ "moderate",
+      Edist > 0.72 & Edist <= 0.84 ~ "weak",
+      Edist > 0.84 ~ "under_thresh",
+	    TRUE ~ "NA")) %>%
+	  rowwise() %>% # needed for km calculation
+	  mutate(elev_diff = trg.elev - elev,
+	         km = (distm(c(trg.long, trg.lat), c(long,lat), fun = distGeo)/1000)[1]) %>% # km distance between focal and analog lat/long
+	  left_join(biome) %>%
+    left_join(biome.code) %>%
+    drop_na()
+
+    write.table (biome.current[[trg$PointID]], paste0("../output/current/","current_analog_", trg$PointID, "_biome.txt"),row.names=FALSE)
+    
+    fia.current[[trg$PointID]] <- data.frame(Edist=dsts, id=ids) %>%
+	  filter(Edist <= 1.75) %>%
+	  left_join(ref %>% rownames_to_column("rowname"), by=c("id"="rowname")) %>% # join by 'R' rowname of ref
+	  select(PointID, long, lat, elev, Edist) %>%
+	  mutate(Edist_thresh = case_when(
+      Edist <= 0.6 ~ "strong",
+      Edist > 0.6 & Edist <= 0.72 ~ "moderate",
+      Edist > 0.72 & Edist <= 0.84 ~ "weak",
+      Edist > 0.84 ~ "under_thresh",
+    TRUE ~ "NA")) %>%
+	  rowwise() %>% # needed for km calculation
+	  mutate(elev_diff = trg.elev - elev,
+	         km = (distm(c(trg.long, trg.lat), c(long,lat), fun = distGeo)/1000)[1]) %>% # km distance between focal and analog lat/long
+	  left_join(fia.species) %>%
+	  drop_na() %>% 
+	  select_if(~ !is.numeric(.) || sum(.) != 0) # remove species columns without info
+
+    write.table (fia.current[[trg$PointID]], paste0("../output/current/","current_analog_", trg$PointID, "_FIA.txt"),row.names=FALSE)
+        
+}
+
+```
+
+## Analog summaries
+*Code can be used for multiple target locations, here we will only look at Tiger Mountain FIA and biome results*. 
+
+### Biome dataset
+
+Load results files.  
+
+```{r biome_results}
+# Biome
+current.b.files <- list.files(path="../output/current",full.names=TRUE, pattern = "_biome.txt")
+current.b <- list()
+for (file in current.b.files){
+  name.tmp <- gsub(pattern = "../output/current/current_analog_", replacement = "", x = file)
+  name <- gsub(pattern = "_biome.txt", replacement = "", x = name.tmp)
+  current.b[[name]] <- read.delim(file = file, header=T, sep="", na.strings="NA") %>%
+    mutate(scenario = "current",
+           location = name)
+}
+
+future.b.files <- list.files(path="../output/future",full.names=TRUE, pattern = "_biome.txt")
+future.b <- list()
+for (file in future.b.files){
+  name.tmp <- gsub(pattern = "../output/future/future_analog_", replacement = "", x = file)
+  name <- gsub(pattern = "_biome.txt", replacement = "", x = name.tmp)
+  future.b[[name]] <- read.delim(file = file, header=T, sep="", na.strings="NA") %>%
+    mutate(scenario = "future",
+           location = name) 
+}
+```
+
+Count analogs.  
+
+```{r biome2}
+## Current analogs
+# remove empty elements from list
+current.b <- current.b[map(current.b, ~dim(.)[1]) > 0]
+# bind rows from list to dataframe    
+current.b.df <-  bind_rows(current.b, .id = "PlotID") %>%
+  filter(Edist <= 0.84) 
+  
+## Future analogs
+# remove empty elements from list
+future.b <- future.b[map(future.b, ~dim(.)[1]) > 0]
+# bind rows from list to dataframe    
+future.b.df <-  bind_rows(future.b, .id = "PlotID") %>%
+  filter(Edist <= 0.84) 
+
+b.plot <- current.b.df %>%
+  bind_rows(future.b.df) %>%
+  select(PlotID, scenario, Edist, Edist_thresh, elev, elev_diff, km)
+
+b.bar <- ggplot(b.plot, aes(x=scenario, fill=Edist_thresh)) +
+  geom_bar(position="dodge") +
+  labs(title="Biome analog count") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+b.bar
+
+```
+
+Compare current and future.
+
+```{r biome3}
+biome.sup.plots <- current.b.df %>%
+  bind_rows(future.b.df) %>%
+ # filter(PlotID %in% plots) %>%
+  select(-PointID, -long, -lat, -Edist, -Edist_thresh, -elev, -elev_diff, -km, -PointID_biome) %>%
+  group_by(scenario, PlotID, biome_description) %>% # if plots > 1, group by PlotID
+  summarize(n=n()) %>%
+  mutate(freq = n/sum(n)) %>%
+  pivot_wider(id_cols =  "biome_description", names_from = c("PlotID","scenario"), values_from = "freq")
+biome.sup.plots
+
+
+biome.sup.plots.stats <- current.b.df %>%
+  bind_rows(future.b.df) %>%
+#  filter(PlotID %in% plots) %>%
+  select(scenario, elev, elev_diff, km, PlotID) %>%
+  group_by(PlotID, scenario) %>%
+  summarise(n_analog = n(),
+            ave_elev_diff = mean(elev_diff),
+            ave_km = mean(km))
+biome.sup.plots.stats
+
+write.csv(biome.sup.plots, file = "../output/biome_table.csv", row.names = FALSE)
+write.csv(biome.sup.plots.stats, file = "../output/biome_analog_stats.csv", row.names = FALSE)
+```
+
+
+### FIA dataset
+
+Load results files.  
+
+```{r fia_results}
+
+current.f.files <- list.files(path="../output/current",full.names=TRUE, pattern = "_FIA.txt")
+current.f <- list()
+for (file in current.f.files){
+  name.tmp <- gsub(pattern = "../output/current/current_analog_", replacement = "", x = file)
+  name <- gsub(pattern = "_FIA.txt", replacement = "", x = name.tmp)
+  current.f[[name]] <- read.delim(file = file, header=T, sep="", na.strings="NA") %>%
+    mutate(scenario = "current",
+           location = name) 
+}
+
+future.f.files <- list.files(path="../output/future",full.names=TRUE, pattern = "_FIA.txt")
+future.f <- list()
+for (file in future.f.files){
+  name.tmp <- gsub(pattern = "../output/future/future_analog_", replacement = "", x = file)
+  name <- gsub(pattern = "_FIA.txt", replacement = "", x = name.tmp)
+  future.f[[name]] <- read.delim(file = file, header=T, sep="", na.strings="NA") %>%
+    mutate(scenario = "future",
+           location = name) 
+}
+
+```
+
+Count analogs.  
+
+```{r fia2}
+## Current analogs
+# remove empty elements from list
+current.f <- current.f[map(current.f, ~dim(.)[1]) > 0]
+# bind rows from list to dataframe    
+current.f.df <-  bind_rows(current.f, .id = "PlotID") %>%
+  filter(Edist <= 0.84)
+## Future analogs
+# remove empty elements from list
+future.f <- future.f[map(future.f, ~dim(.)[1]) > 0]
+# bind rows from list to dataframe    
+future.f.df <-  bind_rows(future.f, .id = "PlotID") %>%
+  filter(Edist <= 0.84)
+
+f.plot <- current.f.df %>%
+  bind_rows(future.f.df) %>%
+  select(PlotID, scenario, Edist, Edist_thresh, elev, elev_diff, km) 
+
+f.bar <- ggplot(f.plot, aes(x=scenario, fill=Edist_thresh)) +
+  geom_bar(position="dodge") +
+  labs(title="FIA analog count") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+f.bar
+
+```
+
+Compare current and future analogs.
+
+```{r fia3}
+
+
+fia.sup.plots <- current.f.df %>%
+  bind_rows(future.f.df) %>%
+  distinct() %>%
+ # filter(PlotID %in% plots) %>%
+  select(-PointID, -long, -lat, -Edist, -Edist_thresh, -elev, -elev_diff, -km, -PointID_fia) %>%
+  replace(is.na(.), 0) %>%
+  group_by(scenario) %>% # if plots > 1, group by PlotID
+  summarise(n = n(),
+            across(where(is.numeric), sum)) %>%
+  mutate(across(where(is.numeric) & !n, ~.x/n)) %>%
+  pivot_longer(cols = where(is.numeric) & !n, names_to = "species_code", values_to = "freq") %>%
+  select(-n) %>%
+  pivot_wider(names_from = c("scenario"), values_from = freq) %>%
+  mutate(remove = case_when(if_all(starts_with("current"), ~.x < .05) & if_all(starts_with("future"), ~.x < .05) ~ "drop",
+                           TRUE ~ "keep")) %>%
+  filter(remove == "keep") %>%
+  select(-remove) %>%
+  # arrange(desc(current), .by_group = TRUE)  %>%
+#  replace(is.na(.), 0) %>% 
+  left_join(fia.species.lookup)
+fia.sup.plots
+
+
+fia.sup.plots.stats <- current.f.df %>%
+  bind_rows(future.f.df) %>%
+  distinct() %>%
+#  filter(PlotID %in% plots) %>%
+  select(scenario, elev, elev_diff, km, PlotID) %>%
+  group_by(PlotID, scenario) %>%
+  summarise(n_analog = n(),
+            ave_elev_diff = mean(elev_diff),
+            ave_km = mean(km))
+fia.sup.plots.stats
+
+write.csv(fia.sup.plots, file = "../output/FIA_species_table.csv", row.names = FALSE)
+write.csv(fia.sup.plots.stats, file = "../output/FIA_analog_stats.csv", row.names = FALSE)
+
+
+```
+
+
+
+## Session Info
+
+```{r end}
+sessionInfo()
+```
